@@ -2,6 +2,7 @@ package prospector
 
 import (
 	"errors"
+	"expvar"
 	"fmt"
 	"sync"
 	"time"
@@ -15,11 +16,10 @@ import (
 	"github.com/elastic/beats/filebeat/input/file"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
-	"github.com/elastic/beats/libbeat/monitoring"
 )
 
 var (
-	harvesterSkipped = monitoring.NewInt(nil, "filebeat.harvester.skipped")
+	harvesterSkipped = expvar.NewInt("filebeat.harvester.skipped")
 )
 
 type Prospector struct {
@@ -111,7 +111,7 @@ func (p *Prospector) LoadStates(states []file.State) error {
 	p.prospectorer = prospectorer
 
 	// Create empty harvester to check if configs are fine
-	_, err = p.createHarvester(file.State{})
+	_, err = p.createHarvester(file.State{}, []string{})
 	if err != nil {
 		return err
 	}
@@ -277,13 +277,14 @@ func (p *Prospector) waitEvents() {
 }
 
 // createHarvester creates a new harvester instance from the given state
-func (p *Prospector) createHarvester(state file.State) (*harvester.Harvester, error) {
+func (p *Prospector) createHarvester(state file.State, prefixs []string) (*harvester.Harvester, error) {
 
 	outlet := channel.NewOutlet(p.beatDone, p.harvesterChan, p.eventCounter)
 	h, err := harvester.NewHarvester(
 		p.cfg,
 		state,
 		outlet,
+        prefixs,
 	)
 
 	return h, err
@@ -291,7 +292,7 @@ func (p *Prospector) createHarvester(state file.State) (*harvester.Harvester, er
 
 // startHarvester starts a new harvester with the given offset
 // In case the HarvesterLimit is reached, an error is returned
-func (p *Prospector) startHarvester(state file.State, offset int64) error {
+func (p *Prospector) startHarvester(state file.State, offset int64, prefixs []string) error {
 
 	if p.config.HarvesterLimit > 0 && p.registry.len() >= p.config.HarvesterLimit {
 		harvesterSkipped.Add(1)
@@ -303,29 +304,21 @@ func (p *Prospector) startHarvester(state file.State, offset int64) error {
 	state.Finished = false
 
 	// Create harvester with state
-	h, err := p.createHarvester(state)
-	if err != nil {
-		return err
-	}
-
-	// State is directly updated and not through channel to make state update synchronous
-	err = p.updateState(input.NewEvent(state))
+	h, err := p.createHarvester(state, prefixs)
 	if err != nil {
 		return err
 	}
 
 	reader, err := h.Setup()
 	if err != nil {
-		// Set state to finished True again in case of setup failure to make sure
-		// file can be picked up again by a future harvester
-		state.Finished = true
-
-		updateErr := p.updateState(input.NewEvent(state))
-		// This should only happen in the case that filebeat is stopped
-		if updateErr != nil {
-			logp.Err("Error updating state: %v", updateErr)
-		}
 		return fmt.Errorf("Error setting up harvester: %s", err)
+	}
+
+	// State is directly updated and not through channel to make state update immediate
+	// State is only updated after setup is completed successfully
+	err = p.updateState(input.NewEvent(state))
+	if err != nil {
+		return err
 	}
 
 	p.registry.start(h, reader)

@@ -23,6 +23,7 @@ type Event struct {
 	Pipeline     string
 	Fileset      string
 	Module       string
+    Prefixs      []string
 }
 
 func NewEvent(state file.State) *Event {
@@ -40,6 +41,10 @@ func (e *Event) ToMapStr() common.MapStr {
 		"type":                  e.DocumentType,
 		"input_type":            e.InputType,
 	}
+
+    if len(e.Prefixs) > 0 {
+        event["prefix"] = e.Prefixs
+    }
 
 	if e.Fileset != "" && e.Module != "" {
 		event["fileset"] = common.MapStr{

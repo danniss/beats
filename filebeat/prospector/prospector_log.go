@@ -1,26 +1,33 @@
 package prospector
 
 import (
+	"expvar"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/elastic/beats/filebeat/harvester"
 	"github.com/elastic/beats/filebeat/input"
 	"github.com/elastic/beats/filebeat/input/file"
 	"github.com/elastic/beats/libbeat/logp"
-	"github.com/elastic/beats/libbeat/monitoring"
 )
 
 var (
-	filesRenamed   = monitoring.NewInt(nil, "filebeat.prospector.log.files.renamed")
-	filesTruncated = monitoring.NewInt(nil, "filebeat.prospector.log.files.truncated")
+	filesRenamed   = expvar.NewInt("filebeat.prospector.log.files.renamed")
+	filesTruncated = expvar.NewInt("filebeat.prospector.log.files.truncated")
 )
 
 type ProspectorLog struct {
 	Prospector *Prospector
 	config     prospectorConfig
+}
+
+type FileInfoWithPrefix struct {
+    fileInfo os.FileInfo
+    prefixs  []string;
 }
 
 func NewProspectorLog(p *Prospector) (*ProspectorLog, error) {
@@ -32,6 +39,42 @@ func NewProspectorLog(p *Prospector) (*ProspectorLog, error) {
 
 	return prospectorer, nil
 }
+
+func extractPrefix(path string, glob_path string) (prefixs []string) {
+    for true {
+        pos := strings.Index(glob_path, "*")
+        if pos < 0 {
+            break
+        }
+        if path[0:pos] != glob_path[0:pos] {
+            fmt.Println(path[0:pos])
+            return
+        }
+        path = path[pos:]
+        glob_path = glob_path[pos:]
+        if len(glob_path) == 1 {
+            prefixs = append(prefixs, path)
+            return
+        } else {
+            next_match := ""
+            next_end_pos := strings.Index(glob_path, "/")
+            if next_end_pos > -1 {
+                next_match = glob_path[1:next_end_pos + 1]
+            } else {
+                next_match = glob_path[1:]
+            }
+            next_char_pos := strings.Index(path, next_match)
+            if next_char_pos == -1 {
+                return
+            }
+            prefixs = append(prefixs, path[:next_char_pos])
+            path = path[next_char_pos + len(next_match):]
+            glob_path = glob_path[1 + len(next_match):]
+        }
+    }
+    return
+}
+
 
 // LoadStates loads states into prospector
 // It goes through all states coming from the registry. Only the states which match the glob patterns of
@@ -111,9 +154,9 @@ func (p *ProspectorLog) Run() {
 
 // getFiles returns all files which have to be harvested
 // All globs are expanded and then directory and excluded files are removed
-func (p *ProspectorLog) getFiles() map[string]os.FileInfo {
+func (p *ProspectorLog) getFiles() map[string]FileInfoWithPrefix {
 
-	paths := map[string]os.FileInfo{}
+	paths := map[string]FileInfoWithPrefix{}
 
 	for _, glob := range p.config.Paths {
 		// Evaluate the path as a wildcards/shell glob
@@ -162,14 +205,16 @@ func (p *ProspectorLog) getFiles() map[string]os.FileInfo {
 			// It original is harvested by other prospector, states will potentially overwrite each other
 			if p.config.Symlinks {
 				for _, finfo := range paths {
-					if os.SameFile(finfo, fileInfo) {
+					if os.SameFile(finfo.fileInfo, fileInfo) {
 						logp.Info("Same file found as symlink and original. Skipping file: %s", file)
 						continue OUTER
 					}
 				}
 			}
-
-			paths[file] = fileInfo
+            fileInfoWithPrefix := FileInfoWithPrefix{}
+            fileInfoWithPrefix.fileInfo = fileInfo
+            fileInfoWithPrefix.prefixs = extractPrefix(file, glob)
+			paths[file] = fileInfoWithPrefix
 		}
 	}
 
@@ -178,14 +223,13 @@ func (p *ProspectorLog) getFiles() map[string]os.FileInfo {
 
 // matchesFile returns true in case the given filePath is part of this prospector, means matches its glob patterns
 func (p *ProspectorLog) matchesFile(filePath string) bool {
-
-	// Path is cleaned to ensure we always compare clean paths
-	filePath = filepath.Clean(filePath)
-
 	for _, glob := range p.config.Paths {
 
-		// Glob is cleaned to ensure we always compare clean paths
-		glob = filepath.Clean(glob)
+		if runtime.GOOS == "windows" {
+			// Windows allows / slashes which makes glob patterns with / work
+			// But for match we need paths with \ as only file names are compared and no lookup happens
+			glob = strings.Replace(glob, "/", "\\", -1)
+		}
 
 		// Evaluate if glob matches filePath
 		match, err := filepath.Match(glob, filePath)
@@ -207,6 +251,10 @@ func (p *ProspectorLog) scan() {
 
 	for path, info := range p.getFiles() {
 
+        for _, prefix := range info.prefixs {
+            logp.Info("got prefix:%s !!!", prefix)
+        }
+
 		select {
 		case <-p.Prospector.runDone:
 			logp.Info("Scan aborted because prospector stopped.")
@@ -222,10 +270,12 @@ func (p *ProspectorLog) scan() {
 		logp.Debug("prospector", "Check file for harvesting: %s", path)
 
 		// Create new state for comparison
-		newState := file.NewState(info, path)
+		newState := file.NewState(info.fileInfo, path)
 
 		// Load last state
 		lastState := p.Prospector.states.FindPrevious(newState)
+
+        logp.Info("prospector", "file: %s", path)
 
 		// Ignores all files which fall under ignore_older
 		if p.isIgnoreOlder(newState) {
@@ -239,18 +289,18 @@ func (p *ProspectorLog) scan() {
 		// Decides if previous state exists
 		if lastState.IsEmpty() {
 			logp.Debug("prospector", "Start harvester for new file: %s", newState.Source)
-			err := p.Prospector.startHarvester(newState, 0)
+			err := p.Prospector.startHarvester(newState, 0, info.prefixs)
 			if err != nil {
 				logp.Err("Harvester could not be started on new file: %s, Err: %s", newState.Source, err)
 			}
 		} else {
-			p.harvestExistingFile(newState, lastState)
+			p.harvestExistingFile(newState, lastState, info.prefixs)
 		}
 	}
 }
 
 // harvestExistingFile continues harvesting a file with a known state if needed
-func (p *ProspectorLog) harvestExistingFile(newState file.State, oldState file.State) {
+func (p *ProspectorLog) harvestExistingFile(newState file.State, oldState file.State, prefixs []string) {
 
 	logp.Debug("prospector", "Update existing file for harvesting: %s, offset: %v", newState.Source, oldState.Offset)
 
@@ -262,7 +312,7 @@ func (p *ProspectorLog) harvestExistingFile(newState file.State, oldState file.S
 		// This could also be an issue with force_close_older that a new harvester is started after each scan but not needed?
 		// One problem with comparing modTime is that it is in seconds, and scans can happen more then once a second
 		logp.Debug("prospector", "Resuming harvesting of file: %s, offset: %v", newState.Source, oldState.Offset)
-		err := p.Prospector.startHarvester(newState, oldState.Offset)
+		err := p.Prospector.startHarvester(newState, oldState.Offset, prefixs)
 		if err != nil {
 			logp.Err("Harvester could not be started on existing file: %s, Err: %s", newState.Source, err)
 		}
@@ -272,7 +322,7 @@ func (p *ProspectorLog) harvestExistingFile(newState file.State, oldState file.S
 	// File size was reduced -> truncated file
 	if oldState.Finished && newState.Fileinfo.Size() < oldState.Offset {
 		logp.Debug("prospector", "Old file was truncated. Starting from the beginning: %s", newState.Source)
-		err := p.Prospector.startHarvester(newState, 0)
+		err := p.Prospector.startHarvester(newState, 0, prefixs)
 		if err != nil {
 			logp.Err("Harvester could not be started on truncated file: %s, Err: %s", newState.Source, err)
 		}

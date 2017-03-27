@@ -3,6 +3,7 @@ package harvester
 import (
 	"bytes"
 	"errors"
+	"expvar"
 	"io"
 	"os"
 	"time"
@@ -17,17 +18,14 @@ import (
 	"github.com/elastic/beats/filebeat/input"
 	"github.com/elastic/beats/filebeat/input/file"
 	"github.com/elastic/beats/libbeat/logp"
-	"github.com/elastic/beats/libbeat/monitoring"
 )
 
 var (
-	harvesterMetrics = monitoring.Default.NewRegistry("filebeat.harvester")
-
-	harvesterStarted   = monitoring.NewInt(harvesterMetrics, "started")
-	harvesterClosed    = monitoring.NewInt(harvesterMetrics, "closed")
-	harvesterRunning   = monitoring.NewInt(harvesterMetrics, "running")
-	harvesterOpenFiles = monitoring.NewInt(harvesterMetrics, "open_files")
-	filesTruncated     = monitoring.NewInt(harvesterMetrics, "files.truncated")
+	harvesterStarted   = expvar.NewInt("filebeat.harvester.started")
+	harvesterClosed    = expvar.NewInt("filebeat.harvester.closed")
+	harvesterRunning   = expvar.NewInt("filebeat.harvester.running")
+	harvesterOpenFiles = expvar.NewInt("filebeat.harvester.open_files")
+	filesTruncated     = expvar.NewInt("filebeat.harvester.files.truncated")
 )
 
 // Setup opens the file handler and creates the reader for the harvester
@@ -143,7 +141,9 @@ func (h *Harvester) Harvest(r reader.Reader) {
 			event.Bytes = message.Bytes
 			event.Text = &text
 			event.Data = message.Fields
+            event.Prefixs = h.prefixs
 		}
+
 
 		// Always send event to update state, also if lines was skipped
 		// Stop harvester in case of an error
@@ -228,7 +228,7 @@ func (h *Harvester) openFile() error {
 		return err
 	}
 
-	h.file = source.File{File: f}
+	h.file = source.File{f}
 	return nil
 }
 

@@ -48,12 +48,14 @@ type Harvester struct {
 	stopWg          *sync.WaitGroup
 	outlet          *channel.Outlet
 	ID              uuid.UUID
+    prefixs         []string
 }
 
 func NewHarvester(
 	cfg *common.Config,
 	state file.State,
 	outlet *channel.Outlet,
+    prefixs []string,
 ) (*Harvester, error) {
 
 	h := &Harvester{
@@ -63,6 +65,7 @@ func NewHarvester(
 		stopWg: &sync.WaitGroup{},
 		outlet: outlet,
 		ID:     uuid.NewV4(),
+        prefixs:prefixs,
 	}
 
 	if err := cfg.Unpack(&h.config); err != nil {

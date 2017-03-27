@@ -2,16 +2,16 @@ package publisher
 
 import (
 	"errors"
+	"expvar"
 
 	"github.com/elastic/beats/filebeat/input"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
-	"github.com/elastic/beats/libbeat/monitoring"
 	"github.com/elastic/beats/libbeat/publisher"
 )
 
 var (
-	eventsSent = monitoring.NewInt(nil, "publish.events")
+	eventsSent = expvar.NewInt("publish.events")
 )
 
 // LogPublisher provides functionality to start and stop a publisher worker.
@@ -47,6 +47,7 @@ var (
 // getDataEvents returns all events which contain data (not only state updates)
 // together with their associated metadata
 func getDataEvents(events []*input.Event) (dataEvents []common.MapStr, meta []common.MapStr) {
+    logp.Warn("send event")
 	dataEvents = make([]common.MapStr, 0, len(events))
 	meta = make([]common.MapStr, 0, len(events))
 	for _, event := range events {
