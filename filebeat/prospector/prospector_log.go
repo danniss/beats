@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+    "strconv"
 
 	"github.com/elastic/beats/filebeat/harvester"
 	"github.com/elastic/beats/filebeat/input"
@@ -122,6 +123,26 @@ func (p *ProspectorLog) Run() {
 		}()
 	}
 	p.scan()
+    if p.Prospector.tracingStartTime == 0 {
+        p.Prospector.tracingStartTime = int64(time.Now().Unix())
+        go func() {
+            for {
+                select {
+                case file := <- p.Prospector.fileDone:
+                    logp.Warn("close file: %s", file)
+                    p.Prospector.tracingMutex.Lock()
+                    delete(p.Prospector.tracingFiles, file)
+                    if len(p.Prospector.tracingFiles) == 0 {
+                        logp.Warn("tracing finished at %l !!!!!!!!!", p.Prospector.tracingStartTime)
+                        fmt.Printf("progress:{\"table\":\"%v\", \"timestamp\":%v}\n", p.Prospector.config.Fields["table"], p.Prospector.tracingStartTime);
+                        os.Stdout.Sync()
+                        p.Prospector.tracingStartTime = 0;
+                    }
+                    p.Prospector.tracingMutex.Unlock()
+                }
+            }
+        }()
+    }
 
 	// It is important that a first scan is run before cleanup to make sure all new states are read first
 	if p.config.CleanInactive > 0 || p.config.CleanRemoved {
@@ -158,7 +179,10 @@ func (p *ProspectorLog) getFiles() map[string]FileInfoWithPrefix {
 
 	paths := map[string]FileInfoWithPrefix{}
 
-	for _, glob := range p.config.Paths {
+	for _, path := range p.config.Paths {
+        // extract scope filter from path
+        // newPath is a valid glob string
+        scopes, glob := p.extractScopes(path)
 		// Evaluate the path as a wildcards/shell glob
 		matches, err := filepath.Glob(glob)
 		if err != nil {
@@ -214,11 +238,129 @@ func (p *ProspectorLog) getFiles() map[string]FileInfoWithPrefix {
             fileInfoWithPrefix := FileInfoWithPrefix{}
             fileInfoWithPrefix.fileInfo = fileInfo
             fileInfoWithPrefix.prefixs = extractPrefix(file, glob)
-			paths[file] = fileInfoWithPrefix
+            if p.verifyPrefixWithScope(fileInfoWithPrefix.prefixs, scopes) {
+			    paths[file] = fileInfoWithPrefix
+            }
 		}
 	}
 
 	return paths
+}
+
+func (p *ProspectorLog) extractScopes(globPath string) ([]string, string) {
+    newPath := ""
+    parts := strings.Split(globPath, "*")
+    scopes := make([]string, 0)
+    for index, element := range parts {
+        if index == 0 {
+            newPath += element
+            continue
+        } else {
+            newPath += "*"
+        }
+        startIndex := strings.Index(element, "(")
+        endIndex := strings.Index(element, ")")
+        if startIndex == 0 && endIndex > 0 {
+            scopes = append(scopes, element[startIndex + 1: endIndex])
+            newPath += element[endIndex + 1:]
+        } else {
+            scopes = append(scopes, "")
+            newPath += element
+        }
+    }
+    return scopes, newPath
+}
+
+func (p *ProspectorLog) verifyPrefixWithScope(prefixs []string, scopes []string) bool {
+    if len(prefixs) != len(scopes) {
+        return false
+    }
+    for index, prefix := range prefixs {
+        if scopes[index] == "" {
+            continue
+        }
+        scopeParts := strings.Split(scopes[index], ":")
+        if len(scopeParts) != 3 {
+            return false
+        }
+        if scopeParts[1] == "range" {
+            if strings.Index(scopeParts[2], ">=") == 0 {
+                value, err := strconv.ParseFloat(prefix, 64)
+                if err != nil {
+                    if prefix < scopeParts[2][2:] {
+                        return false
+                    }
+                } else {
+                    target, _ := strconv.ParseFloat(scopeParts[2][2:], 64)
+                    if value < target {
+                        return false
+                    }
+                }
+            } else if strings.Index(scopeParts[2], ">") == 0 {
+                value, err := strconv.ParseFloat(prefix, 64)
+                if err != nil {
+                    if prefix <= scopeParts[2][1:] {
+                        return false
+                    }
+                } else {
+                    target, _ := strconv.ParseFloat(scopeParts[2][1:], 64)
+                    if value <= target {
+                        return false
+                    }
+                }
+            } else if strings.Index(scopeParts[2], "<=") == 0 {
+                value, err := strconv.ParseFloat(prefix, 64)
+                if err != nil {
+                    if prefix > scopeParts[2][2:] {
+                        return false
+                    }
+                } else {
+                    target, _ := strconv.ParseFloat(scopeParts[2][2:], 64)
+                    if value > target {
+                        return false
+                    }
+                }
+            } else if strings.Index(scopeParts[2], "<") == 0 {
+                value, err := strconv.ParseFloat(prefix, 64)
+                if err != nil {
+                    if prefix >= scopeParts[2][1:] {
+                        return false
+                    }
+                } else {
+                    target, _ := strconv.ParseFloat(scopeParts[2][1:], 64)
+                    if value >= target {
+                        return false
+                    }
+                }
+            } else if strings.Index(scopeParts[2], "=") == 0 {
+                if prefix != scopeParts[2][1:] {
+                    return false
+                }
+            } else if strings.Index(scopeParts[2], "!=") == 0 {
+                if prefix == scopeParts[2][2:] {
+                    return false
+                }
+            }
+        } else if scopeParts[1] == "list" {
+            match := false
+            for _, item := range strings.Split(scopeParts[2], ",") {
+                if item == prefix {
+                    match = true
+                }
+            }
+            if !match {
+                return false
+            }
+        } else if scopeParts[1] == "exclude" {
+            for _, item := range strings.Split(scopeParts[2], ",") {
+                if item == prefix {
+                    return false
+                }
+            }
+
+        }
+    }
+    return true;
 }
 
 // matchesFile returns true in case the given filePath is part of this prospector, means matches its glob patterns
@@ -248,12 +390,10 @@ func (p *ProspectorLog) matchesFile(filePath string) bool {
 
 // Scan starts a scanGlob for each provided path/glob
 func (p *ProspectorLog) scan() {
+    logp.Warn("scan");
+    needToHarveste := false;
 
 	for path, info := range p.getFiles() {
-
-        for _, prefix := range info.prefixs {
-            logp.Info("got prefix:%s !!!", prefix)
-        }
 
 		select {
 		case <-p.Prospector.runDone:
@@ -275,8 +415,6 @@ func (p *ProspectorLog) scan() {
 		// Load last state
 		lastState := p.Prospector.states.FindPrevious(newState)
 
-        logp.Info("prospector", "file: %s", path)
-
 		// Ignores all files which fall under ignore_older
 		if p.isIgnoreOlder(newState) {
 			err := p.handleIgnoreOlder(lastState, newState)
@@ -292,15 +430,23 @@ func (p *ProspectorLog) scan() {
 			err := p.Prospector.startHarvester(newState, 0, info.prefixs)
 			if err != nil {
 				logp.Err("Harvester could not be started on new file: %s, Err: %s", newState.Source, err)
-			}
+			} else {
+                needToHarveste = true
+            }
 		} else {
-			p.harvestExistingFile(newState, lastState, info.prefixs)
+			if p.harvestExistingFile(newState, lastState, info.prefixs) {
+                needToHarveste = true
+            }
 		}
 	}
+    if !needToHarveste {
+        // do not need to harvest, this means we can safwly update timestamp to now
+        fmt.Printf("progress:{\"table\":\"%v\", \"timestamp\":%v}\n", p.Prospector.config.Fields["table"], int64(time.Now().Unix()));
+    }
 }
 
 // harvestExistingFile continues harvesting a file with a known state if needed
-func (p *ProspectorLog) harvestExistingFile(newState file.State, oldState file.State, prefixs []string) {
+func (p *ProspectorLog) harvestExistingFile(newState file.State, oldState file.State, prefixs []string) bool {
 
 	logp.Debug("prospector", "Update existing file for harvesting: %s, offset: %v", newState.Source, oldState.Offset)
 
@@ -315,20 +461,22 @@ func (p *ProspectorLog) harvestExistingFile(newState file.State, oldState file.S
 		err := p.Prospector.startHarvester(newState, oldState.Offset, prefixs)
 		if err != nil {
 			logp.Err("Harvester could not be started on existing file: %s, Err: %s", newState.Source, err)
+            return false;
 		}
-		return
+		return true;
 	}
 
 	// File size was reduced -> truncated file
 	if oldState.Finished && newState.Fileinfo.Size() < oldState.Offset {
 		logp.Debug("prospector", "Old file was truncated. Starting from the beginning: %s", newState.Source)
 		err := p.Prospector.startHarvester(newState, 0, prefixs)
+		filesTruncated.Add(1)
 		if err != nil {
 			logp.Err("Harvester could not be started on truncated file: %s, Err: %s", newState.Source, err)
+            return false;
 		}
+		return true
 
-		filesTruncated.Add(1)
-		return
 	}
 
 	// Check if file was renamed
@@ -355,9 +503,11 @@ func (p *ProspectorLog) harvestExistingFile(newState file.State, oldState file.S
 	if !oldState.Finished {
 		// Nothing to do. Harvester is still running and file was not renamed
 		logp.Debug("prospector", "Harvester for file is still running: %s", newState.Source)
+        return true
 	} else {
 		logp.Debug("prospector", "File didn't change: %s", newState.Source)
 	}
+    return false
 }
 
 // handleIgnoreOlder handles states which fall under ignore older

@@ -38,6 +38,10 @@ type Prospector struct {
 	Once          bool
 	registry      *harvesterRegistry
 	beatDone      chan struct{}
+	fileDone      chan string // channel to receive file done message
+    tracingStartTime     int64
+    tracingFiles  map[string]bool // harvesting files
+    tracingMutex  *sync.Mutex
 	eventCounter  *sync.WaitGroup
 }
 
@@ -65,6 +69,10 @@ func NewProspector(cfg *common.Config, outlet Outlet, beatDone chan struct{}) (*
 		Once:          false,
 		registry:      newHarvesterRegistry(),
 		beatDone:      beatDone,
+        fileDone:      make(chan string),
+        tracingStartTime:     0,
+        tracingFiles:  make(map[string]bool),
+        tracingMutex:  &sync.Mutex{},
 		eventCounter:  &sync.WaitGroup{},
 	}
 
@@ -293,6 +301,7 @@ func (p *Prospector) createHarvester(state file.State, prefixs []string) (*harve
 // startHarvester starts a new harvester with the given offset
 // In case the HarvesterLimit is reached, an error is returned
 func (p *Prospector) startHarvester(state file.State, offset int64, prefixs []string) error {
+    logp.Warn("try start harvester for file: %s", state.Source)
 
 	if p.config.HarvesterLimit > 0 && p.registry.len() >= p.config.HarvesterLimit {
 		harvesterSkipped.Add(1)
@@ -321,6 +330,13 @@ func (p *Prospector) startHarvester(state file.State, offset int64, prefixs []st
 		return err
 	}
 
+    if p.tracingStartTime == 0 {
+        logp.Warn("start harvester for file: %s", state.Source)
+        p.tracingMutex.Lock()
+        p.tracingFiles[state.Source] = true
+        p.tracingMutex.Unlock()
+    }
+    h.FileDone = p.fileDone
 	p.registry.start(h, reader)
 
 	return nil

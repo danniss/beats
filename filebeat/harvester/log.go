@@ -322,6 +322,12 @@ func (h *Harvester) close() {
 		logp.Warn("Stopping harvester, NOT closing file as file info not available: %s", h.state.Source)
 	}
 
+    if h.FileDone != nil {
+        h.FileDone <- h.state.Source
+    }
+    logp.Warn("close harvester for file: %s", h.state.Source)
+    
+
 	harvesterClosed.Add(1)
 }
 

@@ -39,6 +39,7 @@ type Harvester struct {
 	config          harvesterConfig
 	state           file.State
 	prospectorChan  chan *input.Event
+    FileDone        chan string
 	file            source.FileSource /* the file being watched */
 	fileReader      *LogFile
 	encodingFactory encoding.EncodingFactory
